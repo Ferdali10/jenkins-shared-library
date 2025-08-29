@@ -191,30 +191,29 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
             }
         }
 
-     stage('🚀 Déploiement Kubernetes') {
-    steps {
-        script {
-            echo "🚀 Déploiement sur Kubernetes via Shared Library avec kubeconfig sécurisé..."
-            
-            withCredentials([file(credentialsId: 'kubeconfig-admin', variable: 'KUBECONFIG_FILE')]) {
-                kubernetesDeploy(
-                    kubeConfigPath: KUBECONFIG_FILE,   // 🔥 sans env.
-                    manifestDir: env.K8S_MANIFEST_DIR
-                )
-                
-                sh """
-                    export KUBECONFIG=${KUBECONFIG_FILE}
-                    echo "📊 État des déploiements, services et pods:"
-                    kubectl get deployments,services,pods -o wide
-                    echo "🔍 Vérification du service springfoyer-service:"
-                    kubectl get service springfoyer-service
-                    echo "✅ Application accessible via: http://10.0.4.4:30080"
-                """
+        stage('🚀 Déploiement Kubernetes') {
+            steps {
+                script {
+                    echo "🚀 Déploiement sur Kubernetes via Shared Library avec kubeconfig sécurisé..."
+                    
+                    withCredentials([file(credentialsId: 'kubeconfig-admin', variable: 'KUBECONFIG_FILE')]) {
+                        kubernetesDeploy(
+                            kubeConfigPath: KUBECONFIG_FILE,
+                            manifestDir: env.K8S_MANIFEST_DIR
+                        )
+                        
+                        sh """
+                            export KUBECONFIG=${KUBECONFIG_FILE}
+                            echo "📊 État des déploiements, services et pods:"
+                            kubectl get deployments,services,pods -o wide
+                            echo "🔍 Vérification du service springfoyer-service:"
+                            kubectl get service springfoyer-service
+                            echo "✅ Application accessible via: http://10.0.4.4:30080"
+                        """
+                    }
+                }
             }
         }
-    }
-}
-
 
         stage('🔍 Tests post-déploiement') {
             steps {
@@ -224,7 +223,7 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
                     withCredentials([file(credentialsId: 'kubeconfig-admin', variable: 'KUBECONFIG_FILE')]) {
                         timeout(time: 5, unit: 'MINUTES') {
                             sh """
-                                export KUBECONFIG=${env.KUBECONFIG_FILE}
+                                export KUBECONFIG=${KUBECONFIG_FILE}
                                 kubectl wait --for=condition=available --timeout=300s deployment/springfoyer-deployment
                             """
                         }
@@ -234,7 +233,7 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
                             sh """
                                 curl -f -s --max-time 10 http://10.0.4.4:30080/actuator/health || {
                                     echo "⚠️ Health check échoué, vérification des logs..."
-                                    export KUBECONFIG=${env.KUBECONFIG_FILE}
+                                    export KUBECONFIG=${KUBECONFIG_FILE}
                                     kubectl logs -l app=springfoyer --tail=50
                                     exit 1
                                 }
