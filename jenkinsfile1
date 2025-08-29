@@ -215,6 +215,136 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
             }
         }
 
+        stage('📊 Déploiement Monitoring') {
+            steps {
+                script {
+                    echo "📊 Déploiement de Prometheus et Grafana..."
+                    
+                    withCredentials([file(credentialsId: 'kubeconfig-admin', variable: 'KUBECONFIG_FILE')]) {
+                        // Création des répertoires pour le stockage persistant
+                        sh """
+                            export KUBECONFIG=${KUBECONFIG_FILE}
+                            echo "📁 Création des répertoires de stockage..."
+                            
+                            # Vérifier si les nodes sont accessibles pour créer les répertoires
+                            kubectl get nodes -o wide
+                            
+                            # Note: Les répertoires doivent être créés manuellement sur les nodes Kubernetes
+                            # kubectl exec sur un pod privilégié ou directement sur les nodes
+                            echo "⚠️ Assurez-vous que les répertoires suivants existent sur vos nodes Kubernetes:"
+                            echo "  - /mnt/data/prometheus"
+                            echo "  - /mnt/data/grafana"
+                        """
+                        
+                        // Déploiement des composants de monitoring
+                        sh """
+                            export KUBECONFIG=${KUBECONFIG_FILE}
+                            echo "🚀 Déploiement des manifestes de monitoring..."
+                            
+                            # Appliquer les manifestes de monitoring
+                            kubectl apply -f monitoring/
+                            
+                            echo "⏳ Attente du démarrage des services de monitoring..."
+                            
+                            # Attendre que Prometheus soit prêt
+                            kubectl rollout status deployment/prometheus -n monitoring --timeout=300s
+                            
+                            # Attendre que Grafana soit prêt
+                            kubectl rollout status deployment/grafana -n monitoring --timeout=300s
+                            
+                            echo "📊 État des services de monitoring:"
+                            kubectl get all -n monitoring
+                            
+                            echo "🔍 Services exposés:"
+                            kubectl get services -n monitoring
+                            kubectl get ingress -n monitoring
+                        """
+                        
+                        // Configuration des métriques Spring Boot
+                        sh """
+                            export KUBECONFIG=${KUBECONFIG_FILE}
+                            echo "⚙️ Configuration des métriques Spring Boot..."
+                            
+                            # Vérifier si l'endpoint Prometheus est accessible
+                            kubectl get pods -l app=springfoyer -o wide
+                            
+                            # Test de connectivité aux métriques (via un pod temporaire)
+                            kubectl run --rm -i --tty --restart=Never curl-test --image=curlimages/curl -- sh -c "
+                                curl -s http://springfoyer-service:8080/actuator/health && echo 'Spring Boot accessible' || echo 'Spring Boot non accessible'
+                                curl -s http://springfoyer-service:8080/actuator/prometheus | head -10 && echo '... métriques Prometheus disponibles' || echo 'Métriques non disponibles'
+                            " || true
+                        """
+                        
+                        // Vérification de la connectivité
+                        retry(3) {
+                            sleep 30
+                            sh """
+                                export KUBECONFIG=${KUBECONFIG_FILE}
+                                echo "🧪 Test de connectivité des services de monitoring..."
+                                
+                                # Test Prometheus
+                                kubectl port-forward -n monitoring svc/prometheus-service 9090:9090 --address=0.0.0.0 &
+                                PROMETHEUS_PID=\$!
+                                sleep 5
+                                
+                                curl -f -s --max-time 10 http://localhost:9090/-/healthy || {
+                                    echo "⚠️ Prometheus non accessible"
+                                    kill \$PROMETHEUS_PID || true
+                                    exit 1
+                                }
+                                
+                                kill \$PROMETHEUS_PID || true
+                                
+                                # Test Grafana
+                                kubectl port-forward -n monitoring svc/grafana-service 3000:3000 --address=0.0.0.0 &
+                                GRAFANA_PID=\$!
+                                sleep 5
+                                
+                                curl -f -s --max-time 10 http://localhost:3000/api/health || {
+                                    echo "⚠️ Grafana non accessible"
+                                    kill \$GRAFANA_PID || true
+                                    exit 1
+                                }
+                                
+                                kill \$GRAFANA_PID || true
+                                
+                                echo "✅ Services de monitoring opérationnels"
+                            """
+                        }
+                        
+                        // Affichage des informations d'accès
+                        sh """
+                            export KUBECONFIG=${KUBECONFIG_FILE}
+                            echo "📊 ==============================================="
+                            echo "📊 INFORMATIONS D'ACCÈS AU MONITORING"
+                            echo "📊 ==============================================="
+                            
+                            NODE_IP=\$(kubectl get nodes -o wide | awk 'NR==2{print \$6}')
+                            
+                            echo "🔍 Prometheus:"
+                            echo "   - URL: http://\${NODE_IP}:30090"
+                            echo "   - Status: http://\${NODE_IP}:30090/targets"
+                            
+                            echo "📈 Grafana:"
+                            echo "   - URL: http://\${NODE_IP}:30300"
+                            echo "   - Login: admin / admin123"
+                            
+                            echo "🌐 Via Load Balancer (si configuré):"
+                            kubectl get services -n monitoring --no-headers | while read line; do
+                                service_name=\$(echo \$line | awk '{print \$1}')
+                                external_ip=\$(echo \$line | awk '{print \$4}')
+                                if [ "\$external_ip" != "<none>" ] && [ "\$external_ip" != "<pending>" ]; then
+                                    echo "   - \$service_name: \$external_ip"
+                                fi
+                            done
+                            
+                            echo "📊 ==============================================="
+                        """
+                    }
+                }
+            }
+        }
+
         stage('🔍 Tests post-déploiement') {
             steps {
                 script {
@@ -261,11 +391,24 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
         }
 
         success {
-            echo """
-            🎉 Pipeline terminé avec succès!
-            📱 Application accessible sur: http://10.0.4.4:30080
-            📊 Tableau de bord Kubernetes: kubectl get all
-            """
+            script {
+                withCredentials([file(credentialsId: 'kubeconfig-admin', variable: 'KUBECONFIG_FILE')]) {
+                    sh """
+                        export KUBECONFIG=${KUBECONFIG_FILE}
+                        NODE_IP=\$(kubectl get nodes -o wide | awk 'NR==2{print \$6}')
+                        
+                        echo "🎉 ==============================================="
+                        echo "🎉 PIPELINE TERMINÉ AVEC SUCCÈS!"
+                        echo "🎉 ==============================================="
+                        echo "📱 Application accessible sur: http://10.0.4.4:30080"
+                        echo "📊 Monitoring Prometheus: http://\${NODE_IP}:30090"
+                        echo "📈 Monitoring Grafana: http://\${NODE_IP}:30300"
+                        echo "   - Login Grafana: admin / admin123"
+                        echo "📊 Tableau de bord Kubernetes: kubectl get all"
+                        echo "🎉 ==============================================="
+                    """
+                }
+            }
         }
 
         failure {
@@ -277,6 +420,11 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
                     kubectl get pods -o wide || true
                     kubectl describe deployment springfoyer-deployment || true
                     kubectl logs -l app=springfoyer --tail=100 || true
+                    
+                    echo "🔍 Logs Monitoring en cas d'erreur:"
+                    kubectl get pods -n monitoring || true
+                    kubectl describe deployment prometheus -n monitoring || true
+                    kubectl describe deployment grafana -n monitoring || true
                 """ 
             }
         }
