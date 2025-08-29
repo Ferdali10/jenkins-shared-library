@@ -1,0 +1,285 @@
+@Library('dig-apps-shared-lib') _
+
+pipeline {
+    agent any
+
+    environment {
+        DB_URL = 'jdbc:mysql://mysql-service:3306/springfoyer'
+        DB_USER = credentials('mysql-username')
+        DB_PASSWORD = credentials('mysql-password')
+        SONAR_HOST = 'http://172.201.153.226:9000'
+        SONAR_PROJECT_KEY = 'springfoyer'
+        SONAR_TOKEN = 'squ_db5cca187329fc690c3474a578fb7357e5f4f807'
+        TRIVY_TEMPLATE_URL = 'https://raw.githubusercontent.com/Ferdali10/projectSpring/master/advanced-html.tpl'
+        
+        // Docker
+        DOCKER_IMAGE = 'dalifer/springfoyer'
+        DOCKER_REGISTRY = 'registry.hub.docker.com'
+        
+        // Kubernetes
+        K8S_MANIFEST_DIR = 'k8s'
+        KUBECONFIG_PATH = '/var/lib/jenkins/.kube/config'
+    }
+
+    stages {
+        stage('🔁 Clone du dépôt') {
+            steps {
+                script {
+                    retry(3) {
+                        timeout(time: 10, unit: 'MINUTES') {
+                            checkout scm: [
+                                $class: 'GitSCM',
+                                branches: [[name: "*/master"]],
+                                userRemoteConfigs: [[
+                                    url: "https://github.com/Ferdali10/projectSpring.git",
+                                    credentialsId: "github-pat"
+                                ]],
+                                extensions: [
+                                    [$class: 'CloneOption', depth: 1, shallow: true, timeout: 10],
+                                    [$class: 'CleanBeforeCheckout']
+                                ]
+                            ]
+                        }
+                    }
+                    echo "✅ Clone réussi"
+                }
+            }
+        }
+
+        stage('🏗️ Build Maven') {
+            steps {
+                script {
+                    withEnv([
+                        "SPRING_DATASOURCE_URL=${env.DB_URL}",
+                        "SPRING_DATASOURCE_USERNAME=${env.DB_USER}",
+                        "SPRING_DATASOURCE_PASSWORD=${env.DB_PASSWORD}"
+                    ]) {
+                        sh 'chmod +x ./mvnw'
+                        sh './mvnw clean package -DskipTests -Dspring.profiles.active=prod'
+
+                        def jarFiles = sh(
+                            script: 'find target -name "*.jar" -type f ! -name "*-sources.jar" ! -name "*-javadoc.jar"',
+                            returnStdout: true
+                        ).trim()
+
+                        if (!jarFiles) {
+                            error "❌ Aucun JAR généré. Vérifiez les logs Maven."
+                        }
+
+                        env.JAR_FILE = jarFiles.split('\n')[0].replaceAll('target/', '')
+                        echo "✅ JAR principal: ${env.JAR_FILE}"
+                        archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+                    }
+                }
+            }
+        }
+
+        stage('🐳 Build & Push Docker') {
+            steps {
+                script {
+                    if (!env.JAR_FILE) error "❌ JAR non défini"
+
+                    writeFile file: 'Dockerfile', text: """
+FROM eclipse-temurin:17-jre-jammy
+WORKDIR /app
+COPY target/${env.JAR_FILE} app.jar
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \\
+  CMD curl -f http://localhost:8080/actuator/health || exit 1
+ENTRYPOINT ["java", "-jar", "app.jar"]
+"""
+
+                    sh "docker build -t ${env.DOCKER_IMAGE} ."
+                    sh "docker tag ${env.DOCKER_IMAGE} ${env.DOCKER_IMAGE}:latest"
+                    sh "docker tag ${env.DOCKER_IMAGE} ${env.DOCKER_IMAGE}:${env.BUILD_NUMBER}"
+
+                    withCredentials([usernamePassword(credentialsId: 'docker-hub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASSWORD')]) {
+                        sh """
+                            export DOCKER_CONFIG=/tmp/.docker
+                            mkdir -p \$DOCKER_CONFIG
+                            echo '{"credsStore":""}' > \$DOCKER_CONFIG/config.json
+                            echo "\${DOCKER_PASSWORD}" | docker login -u "\${DOCKER_USER}" --password-stdin
+                            docker push ${env.DOCKER_IMAGE}:latest
+                            docker push ${env.DOCKER_IMAGE}:${env.BUILD_NUMBER}
+                            docker logout
+                            rm -rf /tmp/.docker
+                        """
+                    }
+
+                    env.DOCKER_IMAGE_FULL = "${env.DOCKER_IMAGE}:latest"
+                    echo "✅ Docker build & push terminé: ${env.DOCKER_IMAGE_FULL}"
+                }
+            }
+        }
+
+        stage('🔍 Analyse SonarQube') {
+            steps {
+                script {
+                    sh "curl -f -s ${env.SONAR_HOST}/api/system/status || echo '⚠️ SonarQube non accessible'"
+
+                    sh """
+                        export MAVEN_OPTS="-Djava.net.preferIPv4Stack=true"
+                        ./mvnw sonar:sonar \
+                        -Dsonar.projectKey=${env.SONAR_PROJECT_KEY} \
+                        -Dsonar.host.url=http://10.0.2.4:9000 \
+                        -Dsonar.login=${env.SONAR_TOKEN}
+                    """
+
+                    timeout(time: 15, unit: 'MINUTES') {
+                        def status = sh(
+                            script: """curl -s -u ${env.SONAR_TOKEN}: http://10.0.2.4:9000/api/qualitygates/project_status?projectKey=${env.SONAR_PROJECT_KEY} | jq -r '.projectStatus.status'""",
+                            returnStdout: true
+                        ).trim()
+                        
+                        echo "🟢 Sonar Quality Gate: ${status}"
+                        env.SONAR_QUALITY_GATE_STATUS = status
+                        
+                        if (status != 'OK') {
+                            error "🚨 Sonar Quality Gate failed: ${status}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('📊 Génération Rapport SonarQube') {
+            steps {
+                script {
+                    echo "📊 Génération du rapport SonarQube..."
+                    generateSonarReport([
+                        projectKey: env.SONAR_PROJECT_KEY,
+                        sonarHost: 'http://172.201.153.226:9000',
+                        sonarToken: env.SONAR_TOKEN,
+                        qualityGate: [
+                            status: env.SONAR_QUALITY_GATE_STATUS ?: 'UNKNOWN'
+                        ],
+                        projectUrl: 'http://172.201.153.226:9000/projects'
+                    ])
+                    echo "✅ Rapport SonarQube généré avec succès"
+                }
+            }
+        }
+
+        stage('🔒 Analyse Trivy') {
+            steps {
+                script {
+                    def jsonOutput = 'trivy-report.json'
+                    def htmlOutput = 'trivy-report.html'
+                    sh """
+                        curl -sL ${env.TRIVY_TEMPLATE_URL} -o html-advanced.tpl
+                        trivy image --download-db-only
+                        trivy image --severity HIGH,CRITICAL --ignore-unfixed --format json -o ${jsonOutput} ${env.DOCKER_IMAGE_FULL}
+                        trivy image --severity HIGH,CRITICAL --ignore-unfixed --format template --template '@html-advanced.tpl' -o ${htmlOutput} ${env.DOCKER_IMAGE_FULL}
+                    """
+                    archiveArtifacts artifacts: "${jsonOutput},${htmlOutput}", fingerprint: true
+                    publishHTML([reportDir: '.', reportFiles: htmlOutput, reportName: '📊 Rapport Trivy', keepAll: true])
+                }
+            }
+        }
+
+        stage('☸️ Mise à jour des manifestes Kubernetes') {
+            steps {
+                script {
+                    echo "🔧 Mise à jour des manifestes Kubernetes..."
+                    sh """
+                        sed -i 's|<REGISTRY>/springfoyer:latest|${env.DOCKER_IMAGE_FULL}|g' ${env.K8S_MANIFEST_DIR}/deployment.yaml
+                        echo "✅ Manifeste mis à jour avec l'image: ${env.DOCKER_IMAGE_FULL}"
+                        ls -la ${env.K8S_MANIFEST_DIR}/
+                        cat ${env.K8S_MANIFEST_DIR}/deployment.yaml
+                    """
+                }
+            }
+        }
+
+     stage('🚀 Déploiement Kubernetes') {
+    steps {
+        script {
+            echo "🚀 Déploiement sur Kubernetes via Shared Library avec kubeconfig sécurisé..."
+            
+            withCredentials([file(credentialsId: 'kubeconfig-admin', variable: 'KUBECONFIG_FILE')]) {
+                kubernetesDeploy(
+                    kubeConfigPath: KUBECONFIG_FILE,   // 🔥 sans env.
+                    manifestDir: env.K8S_MANIFEST_DIR
+                )
+                
+                sh """
+                    export KUBECONFIG=${KUBECONFIG_FILE}
+                    echo "📊 État des déploiements, services et pods:"
+                    kubectl get deployments,services,pods -o wide
+                    echo "🔍 Vérification du service springfoyer-service:"
+                    kubectl get service springfoyer-service
+                    echo "✅ Application accessible via: http://10.0.4.4:30080"
+                """
+            }
+        }
+    }
+}
+
+
+        stage('🔍 Tests post-déploiement') {
+            steps {
+                script {
+                    echo "🧪 Tests de santé de l'application..."
+                    
+                    withCredentials([file(credentialsId: 'kubeconfig-admin', variable: 'KUBECONFIG_FILE')]) {
+                        timeout(time: 5, unit: 'MINUTES') {
+                            sh """
+                                export KUBECONFIG=${env.KUBECONFIG_FILE}
+                                kubectl wait --for=condition=available --timeout=300s deployment/springfoyer-deployment
+                            """
+                        }
+                        
+                        retry(3) {
+                            sleep 10
+                            sh """
+                                curl -f -s --max-time 10 http://10.0.4.4:30080/actuator/health || {
+                                    echo "⚠️ Health check échoué, vérification des logs..."
+                                    export KUBECONFIG=${env.KUBECONFIG_FILE}
+                                    kubectl logs -l app=springfoyer --tail=50
+                                    exit 1
+                                }
+                            """
+                        }
+                    }
+                    
+                    echo "✅ Application déployée et accessible sur http://10.0.4.4:30080"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                sh """
+                    export DOCKER_CONFIG=/tmp/.docker
+                    docker system prune -f || true
+                    docker logout || true
+                    rm -rf /tmp/.docker || true
+                """
+                archiveArtifacts artifacts: 'target/*.jar,Dockerfile,trivy-report.json,trivy-report.html,sonar-report-*.html', allowEmptyArchive: true
+            }
+        }
+
+        success {
+            echo """
+            🎉 Pipeline terminé avec succès!
+            📱 Application accessible sur: http://10.0.4.4:30080
+            📊 Tableau de bord Kubernetes: kubectl get all
+            """
+        }
+
+        failure {
+            script {
+                echo "❌ Pipeline échoué - vérifier les logs"
+                sh """
+                    export KUBECONFIG=${env.KUBECONFIG_PATH}
+                    echo "🔍 Logs Kubernetes en cas d'erreur:"
+                    kubectl get pods -o wide || true
+                    kubectl describe deployment springfoyer-deployment || true
+                    kubectl logs -l app=springfoyer --tail=100 || true
+                """ 
+            }
+        }
+    }
+}
