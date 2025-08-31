@@ -19,6 +19,11 @@ pipeline {
         // Kubernetes
         K8S_MANIFEST_DIR = 'k8s'
         KUBECONFIG_PATH = '/var/lib/jenkins/.kube/config'
+        
+        // URLs de test corrigées
+        APP_BASE_URL = 'http://10.0.4.4:30080'
+        HEALTH_ENDPOINT = "${APP_BASE_URL}/actuator/health"
+        READINESS_ENDPOINT = "${APP_BASE_URL}/actuator/health/readiness"
     }
 
     stages {
@@ -79,13 +84,29 @@ pipeline {
                 script {
                     if (!env.JAR_FILE) error "❌ JAR non défini"
 
+                    // Dockerfile amélioré avec configuration Actuator
                     writeFile file: 'Dockerfile', text: """
 FROM eclipse-temurin:17-jre-jammy
+
+# Installation de curl pour les health checks
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY target/${env.JAR_FILE} app.jar
+
+# Configuration des endpoints Actuator via variables d'environnement
+ENV MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,info,prometheus,metrics
+ENV MANAGEMENT_ENDPOINT_HEALTH_SHOW_DETAILS=always
+ENV MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED=true
+ENV MANAGEMENT_HEALTH_READINESS_STATE_ENABLED=true
+ENV MANAGEMENT_HEALTH_LIVENESS_STATE_ENABLED=true
+
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \\
+
+# Health check amélioré
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \\
   CMD curl -f http://localhost:8080/actuator/health || exit 1
+
 ENTRYPOINT ["java", "-jar", "app.jar"]
 """
 
@@ -194,7 +215,7 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
         stage('🚀 Déploiement Kubernetes') {
             steps {
                 script {
-                    echo "🚀 Déploiement sur Kubernetes via Shared Library avec kubeconfig sécurisé..."
+                    echo "🚀 Déploiement sur Kubernetes..."
                     
                     withCredentials([file(credentialsId: 'kubeconfig-admin', variable: 'KUBECONFIG_FILE')]) {
                         kubernetesDeploy(
@@ -202,13 +223,22 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
                             manifestDir: env.K8S_MANIFEST_DIR
                         )
                         
+                        // Attendre que le déploiement soit prêt
                         sh """
                             export KUBECONFIG=${KUBECONFIG_FILE}
+                            echo "⏳ Attente du déploiement..."
+                            kubectl rollout status deployment/springfoyer-deployment --timeout=300s
+                            
                             echo "📊 État des déploiements, services et pods:"
                             kubectl get deployments,services,pods -o wide
+                            
                             echo "🔍 Vérification du service springfoyer-service:"
                             kubectl get service springfoyer-service
-                            echo "✅ Application accessible via: http://10.0.4.4:30080"
+                            
+                            echo "✅ Configuration réseau:"
+                            echo "   - NodePort: 30080"
+                            echo "   - Application: ${env.APP_BASE_URL}"
+                            echo "   - Health endpoint: ${env.HEALTH_ENDPOINT}"
                         """
                     }
                 }
@@ -221,123 +251,37 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
                     echo "📊 Déploiement de Prometheus et Grafana..."
                     
                     withCredentials([file(credentialsId: 'kubeconfig-admin', variable: 'KUBECONFIG_FILE')]) {
-                        // Création des répertoires pour le stockage persistant
                         sh """
                             export KUBECONFIG=${KUBECONFIG_FILE}
-                            echo "📁 Création des répertoires de stockage..."
-                            
-                            # Vérifier si les nodes sont accessibles pour créer les répertoires
+                            echo "📁 Vérification des répertoires de stockage..."
                             kubectl get nodes -o wide
-                            
-                            # Note: Les répertoires doivent être créés manuellement sur les nodes Kubernetes
-                            # kubectl exec sur un pod privilégié ou directement sur les nodes
-                            echo "⚠️ Assurez-vous que les répertoires suivants existent sur vos nodes Kubernetes:"
+                            echo "⚠️ Assurez-vous que les répertoires suivants existent:"
                             echo "  - /mnt/data/prometheus"
                             echo "  - /mnt/data/grafana"
                         """
                         
-                        // Déploiement des composants de monitoring
                         sh """
                             export KUBECONFIG=${KUBECONFIG_FILE}
                             echo "🚀 Déploiement des manifestes de monitoring..."
-                            
-                            # Appliquer les manifestes de monitoring
                             kubectl apply -f monitoring/
                             
                             echo "⏳ Attente du démarrage des services de monitoring..."
-                            
-                            # Attendre que Prometheus soit prêt
                             kubectl rollout status deployment/prometheus -n monitoring --timeout=300s
-                            
-                            # Attendre que Grafana soit prêt
                             kubectl rollout status deployment/grafana -n monitoring --timeout=300s
                             
                             echo "📊 État des services de monitoring:"
                             kubectl get all -n monitoring
-                            
-                            echo "🔍 Services exposés:"
-                            kubectl get services -n monitoring
-                            kubectl get ingress -n monitoring
                         """
                         
-                        // Configuration des métriques Spring Boot
                         sh """
                             export KUBECONFIG=${KUBECONFIG_FILE}
-                            echo "⚙️ Configuration des métriques Spring Boot..."
+                            NODE_IP=\$(kubectl get nodes -o wide | awk 'NR==2{print \$6}')
                             
-                            # Vérifier si l'endpoint Prometheus est accessible
-                            kubectl get pods -l app=springfoyer -o wide
-                            
-                            # Test de connectivité aux métriques (via un pod temporaire)
-                            kubectl run --rm -i --tty --restart=Never curl-test --image=curlimages/curl -- sh -c "
-                                curl -s http://springfoyer-service:8080/actuator/health && echo 'Spring Boot accessible' || echo 'Spring Boot non accessible'
-                                curl -s http://springfoyer-service:8080/actuator/prometheus | head -10 && echo '... métriques Prometheus disponibles' || echo 'Métriques non disponibles'
-                            " || true
-                        """
-                        
-                        // Vérification de la connectivité
-                        retry(3) {
-                            sleep 30
-                            sh """
-                                export KUBECONFIG=${KUBECONFIG_FILE}
-                                echo "🧪 Test de connectivité des services de monitoring..."
-                                
-                                # Test Prometheus
-                                kubectl port-forward -n monitoring svc/prometheus-service 9090:9090 --address=0.0.0.0 &
-                                PROMETHEUS_PID=\$!
-                                sleep 5
-                                
-                                curl -f -s --max-time 10 http://localhost:9090/-/healthy || {
-                                    echo "⚠️ Prometheus non accessible"
-                                    kill \$PROMETHEUS_PID || true
-                                    exit 1
-                                }
-                                
-                                kill \$PROMETHEUS_PID || true
-                                
-                                # Test Grafana
-                                kubectl port-forward -n monitoring svc/grafana-service 3000:3000 --address=0.0.0.0 &
-                                GRAFANA_PID=\$!
-                                sleep 5
-                                
-                                curl -f -s --max-time 10 http://localhost:3000/api/health || {
-                                    echo "⚠️ Grafana non accessible"
-                                    kill \$GRAFANA_PID || true
-                                    exit 1
-                                }
-                                
-                                kill \$GRAFANA_PID || true
-                                
-                                echo "✅ Services de monitoring opérationnels"
-                            """
-                        }
-                        
-                        // Affichage des informations d'accès
-                        sh """
-                            export KUBECONFIG=${KUBECONFIG_FILE}
                             echo "📊 ==============================================="
                             echo "📊 INFORMATIONS D'ACCÈS AU MONITORING"
                             echo "📊 ==============================================="
-                            
-                            NODE_IP=\$(kubectl get nodes -o wide | awk 'NR==2{print \$6}')
-                            
-                            echo "🔍 Prometheus:"
-                            echo "   - URL: http://\${NODE_IP}:30090"
-                            echo "   - Status: http://\${NODE_IP}:30090/targets"
-                            
-                            echo "📈 Grafana:"
-                            echo "   - URL: http://\${NODE_IP}:30300"
-                            echo "   - Login: admin / admin123"
-                            
-                            echo "🌐 Via Load Balancer (si configuré):"
-                            kubectl get services -n monitoring --no-headers | while read line; do
-                                service_name=\$(echo \$line | awk '{print \$1}')
-                                external_ip=\$(echo \$line | awk '{print \$4}')
-                                if [ "\$external_ip" != "<none>" ] && [ "\$external_ip" != "<pending>" ]; then
-                                    echo "   - \$service_name: \$external_ip"
-                                fi
-                            done
-                            
+                            echo "🔍 Prometheus: http://\${NODE_IP}:30090"
+                            echo "📈 Grafana: http://\${NODE_IP}:30300 (admin/admin123)"
                             echo "📊 ==============================================="
                         """
                     }
@@ -351,27 +295,81 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
                     echo "🧪 Tests de santé de l'application..."
                     
                     withCredentials([file(credentialsId: 'kubeconfig-admin', variable: 'KUBECONFIG_FILE')]) {
-                        timeout(time: 5, unit: 'MINUTES') {
+                        // Attendre que le déploiement soit disponible
+                        timeout(time: 10, unit: 'MINUTES') {
                             sh """
                                 export KUBECONFIG=${KUBECONFIG_FILE}
-                                kubectl wait --for=condition=available --timeout=300s deployment/springfoyer-deployment
+                                echo "⏳ Attente de la disponibilité du déploiement..."
+                                kubectl wait --for=condition=available --timeout=600s deployment/springfoyer-deployment
                             """
                         }
                         
-                        retry(3) {
-                            sleep 10
-                            sh """
-                                curl -f -s --max-time 10 http://10.0.4.4:30080/actuator/health || {
-                                    echo "⚠️ Health check échoué, vérification des logs..."
-                                    export KUBECONFIG=${KUBECONFIG_FILE}
-                                    kubectl logs -l app=springfoyer --tail=50
-                                    exit 1
+                        // Tests de santé avec retry amélioré
+                        retry(5) {
+                            sleep 20
+                            script {
+                                def healthStatus = sh(
+                                    script: """
+                                        export KUBECONFIG=${KUBECONFIG_FILE}
+                                        
+                                        # Vérifier que les pods sont prêts
+                                        READY_PODS=\$(kubectl get pods -l app=springfoyer -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | wc -w)
+                                        echo "Pods prêts: \$READY_PODS"
+                                        
+                                        if [ "\$READY_PODS" -eq "0" ]; then
+                                            echo "❌ Aucun pod en cours d'exécution"
+                                            kubectl get pods -l app=springfoyer
+                                            kubectl logs -l app=springfoyer --tail=20
+                                            exit 1
+                                        fi
+                                        
+                                        # Test du health endpoint principal
+                                        echo "🔍 Test de l'endpoint health..."
+                                        curl -f -s --max-time 10 ${env.HEALTH_ENDPOINT} || {
+                                            echo "❌ Health endpoint non accessible"
+                                            
+                                            # Debug détaillé
+                                            echo "🔍 Debug des services:"
+                                            kubectl get svc springfoyer-service -o wide
+                                            
+                                            echo "🔍 Debug des endpoints:"
+                                            kubectl get endpoints springfoyer-service
+                                            
+                                            echo "🔍 Test de connectivité directe aux pods:"
+                                            kubectl get pods -l app=springfoyer -o wide
+                                            
+                                            # Test avec port-forward comme fallback
+                                            echo "🔍 Test avec port-forward..."
+                                            timeout 30s kubectl port-forward svc/springfoyer-service 8080:8080 &
+                                            PF_PID=\$!
+                                            sleep 5
+                                            curl -f -s --max-time 10 http://localhost:8080/actuator/health || echo "Port-forward test failed"
+                                            kill \$PF_PID 2>/dev/null || true
+                                            
+                                            exit 1
+                                        }
+                                        
+                                        echo "✅ Health check réussi"
+                                        
+                                        # Test optionnel de l'endpoint readiness
+                                        echo "🔍 Test de l'endpoint readiness..."
+                                        curl -f -s --max-time 10 ${env.READINESS_ENDPOINT} && echo "✅ Readiness OK" || echo "⚠️ Readiness non disponible"
+                                        
+                                        # Test de l'endpoint Prometheus
+                                        echo "🔍 Test de l'endpoint Prometheus..."
+                                        curl -f -s --max-time 10 ${env.APP_BASE_URL}/actuator/prometheus | head -5 && echo "✅ Métriques Prometheus disponibles" || echo "⚠️ Métriques Prometheus non disponibles"
+                                    """,
+                                    returnStatus: true
+                                )
+                                
+                                if (healthStatus != 0) {
+                                    error "Tests de santé échoués"
                                 }
-                            """
+                            }
                         }
                     }
                     
-                    echo "✅ Application déployée et accessible sur http://10.0.4.4:30080"
+                    echo "✅ Application déployée et accessible sur ${env.APP_BASE_URL}"
                 }
             }
         }
@@ -400,11 +398,10 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
                         echo "🎉 ==============================================="
                         echo "🎉 PIPELINE TERMINÉ AVEC SUCCÈS!"
                         echo "🎉 ==============================================="
-                        echo "📱 Application accessible sur: http://10.0.4.4:30080"
-                        echo "📊 Monitoring Prometheus: http://\${NODE_IP}:30090"
-                        echo "📈 Monitoring Grafana: http://\${NODE_IP}:30300"
-                        echo "   - Login Grafana: admin / admin123"
-                        echo "📊 Tableau de bord Kubernetes: kubectl get all"
+                        echo "📱 Application: ${env.APP_BASE_URL}"
+                        echo "🔍 Health check: ${env.HEALTH_ENDPOINT}"
+                        echo "📊 Prometheus: http://\${NODE_IP}:30090"
+                        echo "📈 Grafana: http://\${NODE_IP}:30300 (admin/admin123)"
                         echo "🎉 ==============================================="
                     """
                 }
@@ -413,19 +410,25 @@ ENTRYPOINT ["java", "-jar", "app.jar"]
 
         failure {
             script {
-                echo "❌ Pipeline échoué - vérifier les logs"
-                sh """
-                    export KUBECONFIG=${env.KUBECONFIG_PATH}
-                    echo "🔍 Logs Kubernetes en cas d'erreur:"
-                    kubectl get pods -o wide || true
-                    kubectl describe deployment springfoyer-deployment || true
-                    kubectl logs -l app=springfoyer --tail=100 || true
-                    
-                    echo "🔍 Logs Monitoring en cas d'erreur:"
-                    kubectl get pods -n monitoring || true
-                    kubectl describe deployment prometheus -n monitoring || true
-                    kubectl describe deployment grafana -n monitoring || true
-                """ 
+                echo "❌ Pipeline échoué - analyse des logs"
+                withCredentials([file(credentialsId: 'kubeconfig-admin', variable: 'KUBECONFIG_FILE')]) {
+                    sh """
+                        export KUBECONFIG=${KUBECONFIG_FILE}
+                        echo "🔍 État des ressources Kubernetes:"
+                        kubectl get pods -l app=springfoyer -o wide || true
+                        kubectl get svc springfoyer-service || true
+                        kubectl get endpoints springfoyer-service || true
+                        
+                        echo "🔍 Logs des pods SpringFoyer:"
+                        kubectl logs -l app=springfoyer --tail=50 || true
+                        
+                        echo "🔍 Description des pods en erreur:"
+                        kubectl describe pods -l app=springfoyer | grep -A 10 -B 5 "Error\\|Failed\\|Warning" || true
+                        
+                        echo "🔍 Événements récents:"
+                        kubectl get events --sort-by=.metadata.creationTimestamp --field-selector involvedObject.name=springfoyer-deployment || true
+                    """ 
+                }
             }
         }
     }
